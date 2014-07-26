@@ -1,0 +1,240 @@
+package flag
+
+import (
+	"fmt"
+	"io"
+	"os"
+	"strings"
+)
+
+const (
+	ACTION_HELP    Action = iota
+	ACTION_VERSION        = iota
+	ACTION_GOSPACE        = iota
+)
+
+var (
+	version *Parameter
+	help    *Parameter
+	norun   *Parameter
+	blank   *Parameter
+	shell   *Parameter
+	gosdk   *Parameter
+)
+
+var (
+	DEBUG = false
+)
+
+type Action int
+
+type Callback func(argv *Arguments) (int, error)
+
+type Arguments struct {
+	Blank     bool
+	NoRun     bool
+	GoSDK     string
+	Shell     string
+	ShellArgv []string
+	Path      []string
+}
+
+type Parameter struct {
+	Short       byte
+	Long        string
+	ValueName   string
+	Description string
+}
+
+type Parser struct {
+	gosdkEnv  string
+	shellEnv  string
+	callbacks map[Action]*Callback
+}
+
+func (a *Arguments) AppendShellArgument(value string) {
+	a.ShellArgv = append(a.ShellArgv, value)
+}
+
+func (a *Arguments) AppendPath(value string) {
+	a.Path = append(a.Path, value)
+}
+
+func (p *Parameter) IsFlag() bool {
+	return 0 == len(p.ValueName)
+}
+
+func (p *Parameter) Matches(value string) bool {
+	short := "-" + string(p.Short)
+	long := "--" + p.Long
+
+	return strings.HasPrefix(value, short) ||
+		strings.HasPrefix(value, long)
+}
+
+func (p *Parameter) ParseValue(value string) string {
+	stop := false
+	trim := func(char rune) bool {
+		if stop {
+			return false
+		} else if '=' == char {
+			stop = true
+		}
+
+		return true
+	}
+
+	return strings.TrimLeftFunc(value, trim)
+}
+
+func (p *Parameter) ParseValueOr(value string, env string, fallback string) string {
+	result := p.ParseValue(value)
+
+	switch {
+	case 0 < len(result):
+		return result
+	case 0 < len(env):
+		return os.Getenv(env)
+	case 0 < len(fallback):
+		return fallback
+	default:
+		return ""
+	}
+}
+
+func (p *Parameter) Usage() string {
+	long := p.Long
+
+	if false == p.IsFlag() {
+		long = p.Long + "=" + p.ValueName
+	}
+
+	return fmt.Sprintf("\t-%c,--%s\t\t%s\n",
+		p.Short,
+		long,
+		p.Description)
+}
+
+func (p *Parser) On(action Action, cb *Callback) (self *Parser) {
+	self = p
+
+	log("registering callback", action)
+
+	p.callbacks[action] = cb
+
+	return
+}
+
+func (p *Parser) Parse(input []string) (status int, err error) {
+	passthrough := false
+	argv := NewArguments()
+
+	log("processing commandline", input)
+
+	for _, arg := range input {
+		if passthrough {
+			log("appending shell argument", arg)
+
+			argv.AppendShellArgument(arg)
+		} else {
+			log("processing gospace argument", arg)
+
+			switch {
+			case "--" == arg:
+				log("argument terminator encountered")
+				passthrough = true
+			case help.Matches(arg):
+				log("help action triggered")
+				return p.fire(ACTION_HELP, argv)
+			case version.Matches(arg):
+				log("version action triggered")
+				return p.fire(ACTION_VERSION, argv)
+			case norun.Matches(arg):
+				log("shell spawning is only simulated")
+				argv.NoRun = true
+			case blank.Matches(arg):
+				log("blank flag defined")
+				argv.Blank = true
+			case shell.Matches(arg):
+				log("custom shell argument")
+				argv.Shell = shell.ParseValueOr(arg, p.shellEnv, "")
+			case gosdk.Matches(arg):
+				log("custom go installation provided")
+				argv.GoSDK = gosdk.ParseValueOr(arg, p.gosdkEnv, "")
+			case strings.HasPrefix(arg, "-"):
+				return 0, fmt.Errorf("Unknown argument '%s", arg)
+			default:
+				log("appending to GOPATH", arg)
+				argv.AppendPath(arg)
+			}
+		}
+	}
+
+	return p.fire(ACTION_GOSPACE, argv)
+}
+
+func (p *Parser) fire(action Action, argv *Arguments) (int, error) {
+	if callback, ok := p.callbacks[action]; ok {
+		return (*callback)(argv)
+	}
+
+	log("no callback registered for", action)
+
+	return 0, nil
+}
+
+func init() {
+	version = NewFlagParameter('v', "version", "display the application version and exit")
+	help = NewFlagParameter('h', "help", "show this message and exit")
+	norun = NewFlagParameter('n', "dry", "simulates the shell spawning")
+	blank = NewFlagParameter('b', "blank", "overwrite GOPATH instead of extending it")
+	shell = NewArgParameter('s', "shell", "PATH", "run the workspace in a custom shell")
+	gosdk = NewArgParameter('g', "go", "PATH", "include the go installation in the PATH")
+}
+
+func NewArgParameter(short byte, long string, argument string, description string) *Parameter {
+	return &Parameter{short, long, argument, description}
+}
+
+func NewFlagParameter(short byte, long string, description string) *Parameter {
+	return &Parameter{short, long, "", description}
+}
+
+func NewParser(sdk string, shell string) *Parser {
+	callbacks := make(map[Action]*Callback)
+
+	return &Parser{sdk, shell, callbacks}
+}
+
+func NewArguments() *Arguments {
+	shellParams := []string{}
+	includePath := []string{}
+
+	return &Arguments{false, false, "", "", shellParams, includePath}
+}
+
+func WriteUsage(out io.Writer, application string, description string, footer string) {
+	header := fmt.Sprintf("usage: %s [OPTION]... [PATH]...\n", application)
+
+	io.WriteString(out, header)
+	io.WriteString(out, description)
+	io.WriteString(out, "\n\n")
+
+	io.WriteString(out, "arguments:\n")
+	io.WriteString(out, blank.Usage())
+	io.WriteString(out, norun.Usage())
+	io.WriteString(out, gosdk.Usage())
+	io.WriteString(out, shell.Usage())
+	io.WriteString(out, help.Usage())
+	io.WriteString(out, version.Usage())
+	io.WriteString(out, footer)
+	io.WriteString(out, "\n")
+}
+
+func log(message ...interface{}) {
+	fmt.Println(message...)
+
+	if DEBUG {
+		fmt.Println(message...)
+	}
+}
